@@ -1,0 +1,300 @@
+name: Build APK
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - name: Create project and build
+        run: |
+          mkdir MeterReader && cd MeterReader
+          mkdir -p app
+          cat > app/build.gradle.kts <<'KT_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "ir.meter.reader"
+              compileSdk = 34
+              defaultConfig { applicationId = "ir.meter.reader"; minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "0.1" }
+              buildFeatures { compose = true }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
+          }
+
+          KT_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'KT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+              <application android:label="کنتورخوان" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+
+          KT_EOF
+          mkdir -p app/src/main/java/ir/meter/reader
+          cat > app/src/main/java/ir/meter/reader/MainActivity.kt <<'KT_EOF'
+          package ir.meter.reader
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.bluetooth.BluetoothAdapter
+          import android.bluetooth.BluetoothDevice
+          import android.content.Intent
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import androidx.lifecycle.lifecycleScope
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.launch
+
+          class MainActivity : ComponentActivity() {
+              private var tr: SppTransport? = null
+              private val log = mutableStateListOf<String>()
+              private val readings = mutableStateListOf<Triple<String, String, String>>()
+              private var status by mutableStateOf("متصل نیست")
+              private var busy: Job? = null
+
+              private fun addLog(s: String) { log.add(0, s) }
+
+              @SuppressLint("MissingPermission")
+              private fun connect(d: BluetoothDevice) {
+                  busy = lifecycleScope.launch {
+                      runCatching {
+                          tr?.close(); status = "در حال اتصال…"
+                          tr = SppTransport(d).also { it.open() }
+                          status = "متصل: ${d.name}"
+                      }.onFailure { status = "خطا: ${it.message}" }
+                  }
+              }
+
+              private fun readIec() {
+                  val t = tr ?: return addLog("ابتدا وصل شوید")
+                  busy = lifecycleScope.launch {
+                      runCatching {
+                          readings.clear()
+                          t.write(Iec.REQUEST)
+                          val id = t.read(4000, 1500) { it.lastOrNull() == 10.toByte() }
+                          addLog("IDENT: ${Iec.text(id).trim()}  [${id.toHex()}]")
+                          if (id.isEmpty()) return@launch addLog("پاسخی نیامد؛ شاید کنتور DLMS است")
+                          t.write(Iec.ACK)
+                          val raw = t.read(20000, 3000) { r -> r.lastIndexOf(0x03.toByte()).let { it >= 0 && it + 1 < r.size } }
+                          addLog("DATA (${raw.size}B) BCC ${if (Iec.bccOk(raw)) "OK" else "؟"}")
+                          val txt = Iec.text(raw); addLog(txt)
+                          Iec.parse(txt).forEach { (k, v) -> readings.add(Triple(k, Iec.name(k), v)) }
+                      }.onFailure { addLog("خطا: ${it.message}") }
+                  }
+              }
+
+              private fun sendHex(h: String) {
+                  val t = tr ?: return addLog("ابتدا وصل شوید")
+                  busy = lifecycleScope.launch {
+                      runCatching {
+                          val b = hexToBytes(h); t.write(b); addLog("TX: ${b.toHex()}")
+                          val r = t.read(5000, 1500); addLog("RX: ${r.toHex()}\n${Iec.text(r)}")
+                      }.onFailure { addLog("خطا: ${it.message}") }
+                  }
+              }
+
+              private fun export() {
+                  val csv = "obis,name,value\n" + readings.joinToString("\n") { "${it.first},${it.second},${it.third}" }
+                  startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, csv), "خروجی CSV"))
+              }
+
+              @SuppressLint("MissingPermission")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme {
+                          var devices by remember { mutableStateOf(listOf<BluetoothDevice>()) }
+                          var hex by remember { mutableStateOf(Dlms.SNRM_HEX) }
+                          val perm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+                              if (ok) devices = BluetoothAdapter.getDefaultAdapter()?.bondedDevices?.toList().orEmpty()
+                          }
+                          LaunchedEffect(Unit) {
+                              if (Build.VERSION.SDK_INT >= 31) perm.launch(Manifest.permission.BLUETOOTH_CONNECT)
+                              else devices = BluetoothAdapter.getDefaultAdapter()?.bondedDevices?.toList().orEmpty()
+                          }
+                          Column(Modifier.fillMaxSize().statusBarsPadding().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Text("کنتورخوان – $status", style = MaterialTheme.typography.titleMedium)
+                              Text("دستگاه‌های جفت‌شده (پراب را انتخاب کنید):")
+                              LazyColumn(Modifier.heightIn(max = 110.dp)) {
+                                  items(devices) { d -> TextButton({ connect(d) }) { Text("${d.name} (${d.address})") } }
+                              }
+                              Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                  Button(::readIec) { Text("خواندن IEC") }
+                                  OutlinedButton(::export) { Text("خروجی CSV") }
+                                  OutlinedButton({ tr?.close(); status = "متصل نیست" }) { Text("قطع") }
+                              }
+                              OutlinedTextField(hex, { hex = it }, label = { Text("ارسال HEX خام (DLMS و …)") }, modifier = Modifier.fillMaxWidth())
+                              Button({ sendHex(hex) }) { Text("ارسال") }
+                              HorizontalDivider()
+                              LazyColumn(Modifier.weight(1f)) {
+                                  items(readings) { (k, n, v) -> Text("$k  $n:  $v") }
+                                  items(log) { Text(it, style = MaterialTheme.typography.bodySmall); HorizontalDivider() }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              override fun onDestroy() { tr?.close(); super.onDestroy() }
+          }
+
+          KT_EOF
+          mkdir -p app/src/main/java/ir/meter/reader
+          cat > app/src/main/java/ir/meter/reader/Protocols.kt <<'KT_EOF'
+          package ir.meter.reader
+
+          /** IEC 62056-21 (ex IEC 1107) mode C readout – text protocol used by many meters. */
+          object Iec {
+              val REQUEST = "/?!\r\n".toByteArray()
+              /** ACK, protocol 0, baud '0' (stay at 300), mode 0 = readout. Keeps the probe's baud rate unchanged. */
+              val ACK = byteArrayOf(0x06, '0'.code.toByte(), '0'.code.toByte(), '0'.code.toByte(), 13, 10)
+
+              /** Drop the parity bit (7E1 -> 7 bit ASCII). */
+              fun text(b: ByteArray) = String(ByteArray(b.size) { (b[it].toInt() and 0x7F).toByte() }, Charsets.ISO_8859_1)
+
+              fun parse(t: String): List<Pair<String, String>> =
+                  Regex("""([0-9A-Za-z:.\-*]+)\(([^)]*)\)""").findAll(t).map { it.groupValues[1] to it.groupValues[2] }.toList()
+
+              fun bccOk(raw: ByteArray): Boolean {
+                  val i = raw.indexOf(0x02.toByte()); val e = raw.lastIndexOf(0x03.toByte())
+                  if (i < 0 || e < 0 || e + 1 >= raw.size) return false
+                  var x = 0
+                  for (k in i + 1..e) x = x xor (raw[k].toInt() and 0xFF)
+                  return (x and 0x7F) == (raw[e + 1].toInt() and 0x7F)
+              }
+
+              private val names = mapOf(
+                  "0.0.0" to "شماره سریال", "96.1.0" to "شماره سریال", "0.9.1" to "ساعت", "0.9.2" to "تاریخ",
+                  "1.8.0" to "انرژی اکتیو مصرفی کل", "1.8.1" to "اکتیو تعرفه ۱", "1.8.2" to "اکتیو تعرفه ۲",
+                  "1.8.3" to "اکتیو تعرفه ۳", "1.8.4" to "اکتیو تعرفه ۴", "2.8.0" to "انرژی اکتیو تولیدی",
+                  "3.8.0" to "راکتیو القایی", "4.8.0" to "راکتیو خازنی", "1.6.0" to "دیماند ماکزیمم",
+                  "32.7.0" to "ولتاژ فاز ۱", "52.7.0" to "ولتاژ فاز ۲", "72.7.0" to "ولتاژ فاز ۳",
+                  "31.7.0" to "جریان فاز ۱", "51.7.0" to "جریان فاز ۲", "71.7.0" to "جریان فاز ۳",
+                  "1.7.0" to "توان لحظه‌ای", "14.7.0" to "فرکانس"
+              )
+              fun name(obis: String) = names[obis.substringBefore('*').substringBefore(':')] ?: ""
+          }
+
+          /** DLMS/COSEM helpers. Only link-layer probing for now; AARQ/GET come once we see the meter's response. */
+          object Dlms {
+              /** HDLC SNRM, client 0x10 -> server 0x01 (typical public client). Edit in the app if the meter differs. */
+              const val SNRM_HEX = "7E A0 07 03 21 93 0F 01 7E"
+              const val DISC_HEX = "7E A0 07 03 21 53 03 C7 7E"
+          }
+
+          fun hexToBytes(s: String): ByteArray {
+              val c = s.filter { it.isLetterOrDigit() }
+              require(c.length % 2 == 0) { "طول HEX فرد است" }
+              return ByteArray(c.length / 2) { c.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+          }
+          fun ByteArray.toHex() = joinToString(" ") { "%02X".format(it) }
+
+          KT_EOF
+          mkdir -p app/src/main/java/ir/meter/reader
+          cat > app/src/main/java/ir/meter/reader/Transport.kt <<'KT_EOF'
+          package ir.meter.reader
+
+          import android.annotation.SuppressLint
+          import android.bluetooth.BluetoothAdapter
+          import android.bluetooth.BluetoothDevice
+          import android.bluetooth.BluetoothSocket
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.withContext
+          import java.io.ByteArrayOutputStream
+          import java.util.UUID
+
+          /** Classic Bluetooth SPP transport. A BLE transport can be added later behind the same API. */
+          class SppTransport(private val dev: BluetoothDevice) {
+              private var sock: BluetoothSocket? = null
+
+              @SuppressLint("MissingPermission")
+              suspend fun open() = withContext(Dispatchers.IO) {
+                  BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery()
+                  val s = dev.createRfcommSocketToServiceRecord(UUID.fromString("00001101-0000-1000-8000-00805F9B34FB"))
+                  s.connect(); sock = s
+              }
+
+              suspend fun write(b: ByteArray) = withContext(Dispatchers.IO) {
+                  sock!!.outputStream.write(b); sock!!.outputStream.flush()
+              }
+
+              /** Reads until [stop] is true, [idleMs] of silence after data, or [timeoutMs] overall. */
+              suspend fun read(timeoutMs: Long = 5000, idleMs: Long = 1500, stop: ((ByteArray) -> Boolean)? = null): ByteArray =
+                  withContext(Dispatchers.IO) {
+                      val ins = sock!!.inputStream
+                      val out = ByteArrayOutputStream()
+                      val start = System.currentTimeMillis(); var last = start
+                      while (System.currentTimeMillis() - start < timeoutMs) {
+                          if (ins.available() > 0) {
+                              val buf = ByteArray(ins.available()); val n = ins.read(buf)
+                              out.write(buf, 0, n); last = System.currentTimeMillis()
+                              if (stop?.invoke(out.toByteArray()) == true) break
+                          } else {
+                              if (out.size() > 0 && System.currentTimeMillis() - last > idleMs) break
+                              delay(50)
+                          }
+                      }
+                      out.toByteArray()
+                  }
+
+              fun close() { runCatching { sock?.close() }; sock = null }
+          }
+
+          KT_EOF
+          cat > build.gradle.kts <<'KT_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+
+          KT_EOF
+          cat > settings.gradle.kts <<'KT_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "MeterReader"
+          include(":app")
+
+          KT_EOF
+          gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeterReader-apk
+          path: MeterReader/app/build/outputs/apk/debug/app-debug.apk
